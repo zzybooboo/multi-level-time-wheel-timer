@@ -1,7 +1,7 @@
 #include "types.h"
+#include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <unistd.h>
 #include <string.h>
 
@@ -25,41 +25,6 @@ const size_t sc[TIME_WHELL_SIZE] = {
 	UNIT_YEAR
 };
 
-//清理时间轮 槽里面的链表
-static inline void _timer_solt_clean(timer_solt_t  solt)
-{
-	if (!solt->nodes)
-		return;
-
-	timer_node_t node = solt->nodes;
-	while (node)
-	{
-		free(node);
-		node = node->next;
-	}
-}
-
-//清理时间轮
-static inline void _timer_wheel_clean(tw_timer_t timer)
-{
-	int i = 0;
-	for (; i < TIME_WHELL_SIZE; i++)
-	{
-		if (!timer->wheels[i].solts)
-			continue;
-
-		int j = 0;
-		for (; j < timer->wheels[i].slot_count; j++)
-		{
-			_timer_solt_clean(&timer->wheels[i].solts[j]);
-
-		}
-		//释放槽
-		free(timer->wheels[i].solts);
-		timer->wheels[i].slot_count = 0;
-	}
-}
-
 //初始化槽
 static inline bool _timer_wheel_init(tw_timer_t timer)
 {
@@ -70,7 +35,11 @@ static inline bool _timer_wheel_init(tw_timer_t timer)
 		if (!timer->wheels[level].solts)
 			return false;
 
-		timer->wheels[level].cur_solt = 0;
+		int j = 0;
+		timer->wheels[level].cur_tick = 0;
+		for (; j < solt_counts[level]; j++)
+			INIT_LIST_HEAD(&timer->wheels[level].solts[j].root);
+	
 		timer->wheels[level].slot_count = solt_counts[level];
 	}
 	return true;
@@ -99,7 +68,7 @@ tw_timer_t tw_timer_create(timer_handler_t handler)
 	return timer;
 }
 
-//插入定时器
+//插入定时器,调用此函数，需要将 node 从其他链表中删除
 static inline void _timer_node_insert(tw_timer_t timer, time_wheel_t dst_wheel,timer_node_t node, const int level)
 {
 	const char indexs[] = {
@@ -112,14 +81,8 @@ static inline void _timer_node_insert(tw_timer_t timer, time_wheel_t dst_wheel,t
 		node->solt.year
 	};
 
-	
-	node->prev = NULL;
 	int index = indexs[level];
-	node->next = dst_wheel->solts[index].nodes;
-	if (dst_wheel->solts[index].nodes)
-		dst_wheel->solts[index].nodes->prev = node;
-
-	dst_wheel->solts[index].nodes = node;
+	list_add(&node->node, &dst_wheel->solts[index].root);
 }
 
 //逐级检测
@@ -133,21 +96,12 @@ static inline void _timer_check(tw_timer_t timer)
 
 		time_wheel_t wheel = &timer->wheels[level];
 		time_wheel_t prev_wheel = &timer->wheels[level - 1]; 
- 
-		timer_node_t  node = wheel->solts[wheel->cur_solt].nodes;
-		//printf("check level:%d, cur_solt:%d\n", level, wheel->cur_solt);
-		wheel->solts[wheel->cur_solt].nodes = NULL;
-		
-		while (node)
-		{
-			timer_node_t  cur = node;
-			//删除
-			node = node->next;
-			if (node)
-				node->prev = NULL;
 
-			//插入
-			_timer_node_insert(timer, prev_wheel, cur, level - 1);
+		while (!list_empty(&wheel->solts[wheel->cur_tick].root))
+		{
+			timer_node_t  node = list_first_entry(&wheel->solts[wheel->cur_tick].root, struct timer_node_, node);
+			list_del(node);
+			_timer_node_insert(timer, prev_wheel, node, level - 1);
 		}
 	}
 }
@@ -160,11 +114,11 @@ static inline void _timer_run_wheel(tw_timer_t timer, const int level,
 		return;
 
 	time_wheel_t wheel = &timer->wheels[level];
-	wheel->cur_solt++;
-	if (wheel->cur_solt >= solt_counts[level])
+	wheel->cur_tick++;
+	if (wheel->cur_tick >= solt_counts[level])
 	{
 		//推动下一级
-		wheel->cur_solt = 0;
+		wheel->cur_tick = 0;
 		if (next_level_func)
 			(*next_level_func)(timer);
 	}
@@ -232,18 +186,15 @@ static inline size_t _timer_calculate_interval(timer_interval_t * tv)
 //将hms当前槽的定时器 重新计算下个周期的槽，并插入到目标槽
 static inline size_t _timer_move(tw_timer_t timer,time_wheel_t hms_wheel)
 {
-	//printf("_timer_move,cur_solt:%d\n", hms_wheel->cur_solt);
 	//获取当前hms的solt
-	timer_solt_t solt = &hms_wheel->solts[hms_wheel->cur_solt -1];
-	timer_node_t node = solt->nodes;
-	solt->nodes = NULL;
-
-	while (node)
+	timer_solt_t solt = &hms_wheel->solts[hms_wheel->cur_tick];
+	while (!list_empty(&solt->root))
 	{
-		timer_node_t cur_node = node;
-		node = node->next;
+		timer_node_t node = list_first_entry(&solt->root, struct timer_node_, node);
+		list_del(node);
+		(*timer->handler)(node->param);
 
-		tw_timer_add(timer, cur_node);
+		tw_timer_add(timer, node);
 	}
 }
 
@@ -251,22 +202,17 @@ static inline size_t _timer_move(tw_timer_t timer,time_wheel_t hms_wheel)
 static inline void _timer_run_hms_wheel(tw_timer_t timer)
 {
 	int i = 0;
+	//降级
 	_timer_check(timer);
 	for (; i < TIMER_HMS_SOLT_COUNT && timer->run; i++)
 	{
-		timer->wheels[0].cur_solt++;
-		if (timer->wheels[0].solts[i].nodes)
-		{
-			//调用回调
-			//printf("cur tick:%d\n", timer->tick);
-			(*timer->handler)(timer->wheels[0].solts[i].nodes);
-			//计算下一个执行周期的槽
-			_timer_move(timer, &timer->wheels[0]);
-		}
-		usleep(GRANULARITY);
+		
+		_timer_move(timer, &timer->wheels[0]);
+		timer->wheels[0].cur_tick++;
 		timer->tick++;
+		usleep(GRANULARITY);
 	}
-	timer->wheels[0].cur_solt = 0;
+	timer->wheels[0].cur_tick = 0;
 	//推动秒轮
 	_timer_run_second_wheel(timer);
 }
@@ -279,9 +225,7 @@ void  tw_timer_run(tw_timer_t timer)
 
 	timer->run = true;
 	while (timer->run)
-	{
 		_timer_run_hms_wheel(timer);
-	}
 }
 
 //停止timer
@@ -316,12 +260,21 @@ static inline void _timer_trans_interval(size_t interval,timer_interval_t * tv)
 	}
 }
 
+void   tw_timer_delete(tw_timer_t timer, timer_node_t node)
+{
+	if (!timer || !node)
+		return;
+
+	list_del(node);
+}
+
 //添加timer
-bool  tw_timer_add(tw_timer_t timer, timer_node_t node)
+bool	tw_timer_add(tw_timer_t timer, timer_node_t node)
 {
 	if (!timer)
 		return false;
 	
+	 
 	size_t dst_solt = timer->tick + node->interval;
 	_timer_trans_interval(dst_solt, &node->solt);
 	
@@ -348,6 +301,26 @@ bool  tw_timer_add(tw_timer_t timer, timer_node_t node)
 	return true;
 }
 
+//清理
+static inline void _timer_wheel_clean(tw_timer_t timer)
+{
+	int i = 0;
+	for (; i < TIME_WHELL_SIZE; i++)
+	{
+		time_wheel_t wheel = &timer->wheels[i];
+		int j = 0;
+		for (; j < wheel->slot_count; j++)
+		{
+			timer_solt_t solt = &wheel->solts[j];
+			while (!list_empty(&solt->root))
+			{
+				timer_node_t node = list_first_entry(&solt->root, struct timer_node_, node);
+				list_del(node);
+			}
+		}
+	}
+}
+
 //销毁timer
 void   tw_timer_destory(tw_timer_t timer)
 {
@@ -357,4 +330,19 @@ void   tw_timer_destory(tw_timer_t timer)
 	tw_timer_stop(timer);
 	_timer_wheel_clean(timer);
 	free(timer);
+}
+
+timer_node_t       tw_timer_node_create(size_t interval, void * arg){
+	timer_node_t node = (timer_node_t)calloc(1, sizeof(struct timer_node_));
+	if (node)
+		return NULL;
+
+	node->interval = interval;
+	node->param = arg;
+	return node;
+}
+
+void		       tw_timer_node_free(timer_node_t node)
+{
+	free(node);
 }

@@ -1,6 +1,7 @@
 #ifndef TIME_WHEEL_TIMER_TYPES
 #define TIME_WHEEL_TIMER_TYPES
 
+#include "list.h"
 #include <stdlib.h>
 #include <stdbool.h>
 #include "tw_timer.h"
@@ -24,19 +25,39 @@
 #define UNIT_MONTH  30 * UNIT_DAY
 #define UNIT_YEAR   12 * UNIT_MONTH
 
+//定时器间隔
+typedef struct timer_interval_t
+{
+	unsigned char hms;			// 100ms
+	unsigned char year;			// year
+	unsigned char month;		// month
+	unsigned char day;			// day
+	unsigned char hour;			// hour
+	unsigned char min;			// min
+	unsigned char second;		// second
+}timer_interval_t;
+
+//定时器节点
+typedef struct timer_node_
+{
+	struct list_head        node;
+	timer_interval_t		solt;
+	size_t                  interval;
+	void *					param;
+};
+
 //时间轮的槽
 typedef struct timer_solt_
 {
-	timer_node_t   nodes;
-	unsigned short nodes_count;
+	struct list_head   root;
 }*timer_solt_t;
 
 //时间轮
 typedef struct time_wheel_
 {
-	timer_solt_t   solts;
-	unsigned char  cur_solt;
-	unsigned short slot_count;
+	timer_solt_t        solts;
+	unsigned char		cur_tick;
+	unsigned short		slot_count;
 }*time_wheel_t;
 
 //定时器
